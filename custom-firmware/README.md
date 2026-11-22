@@ -36,7 +36,7 @@ Relocated to `0x6e00` (`94` bytes, up from `97` bytes at `0x6854`) and updated i
 | Home | `G` | `[` | `[` (no `Shift`) |
 | Home | `H` | `]` | `]` (no `Shift`) |
 | Home | `J` | `€` | `Right Alt + 5` |
-| Home | `K` | `` ` `` | `` ` `` (no `Shift`, `dead_grave` on US-Intl) |
+| Home | `K` | `´` | `'` (no `Shift`, `dead_acute` on US-Intl) |
 | Home | `L` | `^` | `Shift + 6` (`dead_circumflex` on US-Intl) |
 | Bottom | `Z` | `+` | `Shift + =` |
 | Bottom | `X` | `=` | `=` (no `Shift`) |
@@ -44,7 +44,7 @@ Relocated to `0x6e00` (`94` bytes, up from `97` bytes at `0x6854`) and updated i
 | Bottom | `V` | `Ç` | `Right Alt + Shift + ,` |
 | Bottom | `B` | `\|` | `Shift + \` |
 | Bottom | `N` | `~` | `Shift + ` `` ` `` (`dead_tilde` on US-Intl) |
-| Bottom | `M` | `´` | `'` (no `Shift`, `dead_acute` on US-Intl) |
+| Bottom | `M` | `` ` `` | `` ` `` (no `Shift`, `dead_grave` on US-Intl) |
 
 ## Build
 
