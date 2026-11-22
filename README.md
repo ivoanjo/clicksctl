@@ -94,3 +94,13 @@ sudo udevadm control --reload && sudo udevadm trigger
 - **Android cases** (Pixel / Razr `CA-*` models) — use raw vendor USB bulk frames directly without the iAP2 handshake.
 - **Clicks Power Keyboard** (`CP-1000`, etc.) and Bluetooth models — use Bluetooth HID rather than USB-C iAP2.
 - **Lightning iPhone 14 cases** (`CK-4100`, `CK-4200`) — different physical interface; untested.
+
+---
+
+## References & Links
+
+- **[rudironsoni/clicks-keyboards-custom-firmware](https://github.com/rudironsoni/clicks-keyboards-custom-firmware)** — CK-5200 reverse engineering, iAP2 link/auth decode (`STOCK_DECODE.md`), and settings protocol (`stock-settings-protocol.md`).
+- **[louis-hsu/ClicksFT](https://github.com/louis-hsu/ClicksFT)** — Clicks Android firmware test app and command table (`clicks_commands.xml`).
+- **[betamax80/ghidra-qingke-xw](https://github.com/betamax80/ghidra-qingke-xw)** — Ghidra processor module for WCH QingKe RISC-V (`Xwchc`), used to decompile and verify the `CK-6100` `V120`/`V122` firmware.
+- **Official Clicks firmware catalog:** `https://xinyi1.clicks.tech/firmwares.json` *(requires a browser `User-Agent` header, e.g. `Mozilla/5.0`).*
+
