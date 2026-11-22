@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""clicksctl - Standalone single-file Linux CLI for Clicks Keyboard settings over USB/iAP2.
+
+Dependencies:
+  - Python 3.10+
+  - pyusb (pip install pyusb) + libusb-1.0
+  - udev rule for non-root access to 352e:2306 (GROUP="plugdev", MODE="0660")
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import struct
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+try:
+    import usb.core
+    import usb.util
+except ImportError as exc:
+    raise SystemExit("pyusb is required. Install with: pip install pyusb") from exc
+
+
+# --- USB & iAP2 constants ---
+
+VID = 0x352E
+PID = 0x2306
+
+ATTACH_HANDSHAKE = bytes.fromhex("ff 55 02 00 ee 10")
+LINK_SYNC_MAGIC = b"\xff\x5a"
+CTRL_SYNC_MAGIC = b"\x40\x40"
+
+CTRL_SYN = 0x80
+CTRL_ACK = 0x40
+CTRL_RST = 0x10
+
+SESSION_CONTROL = 0x0A
+
+MSG_REQUEST_IDENTIFY = 0x1D00
+MSG_IDENTIFY = 0x1D01
+MSG_SESSION_OPEN = 0x1D02
+MSG_AUTH_ACCEPTED = 0xAA04
+MSG_START_POWER_UPDATES = 0xAE00
+MSG_EA_OPEN = 0xEA00
+MSG_EA_CLOSE = 0xEA01
+
+
+# --- Companion protocol constants ---
+
+CMD_GET_VERSION = 0x03
+CMD_FLAGS = 0x83
+CMD_GET_BRIGHTNESS = 0x84
+CMD_GET_BACKLIGHT_TIMEOUT = 0x86
+CMD_GET_IDLE_INTERVAL = 0x88
+CMD_GET_CURRENCY = 0x8A
+CMD_GET_LAYOUT = 0x8C
+CMD_GET_STATUS = 0x8D
+
+CMD_SET_BRIGHTNESS = 0x81
+CMD_SET_BRIGHTNESS_TEMP = 0x82
+CMD_SET_BACKLIGHT_TIMEOUT = 0x85
+CMD_SET_IDLE_INTERVAL = 0x87
+CMD_SET_CURRENCY = 0x89
+CMD_SET_LAYOUT = 0x8B
+
+READ_ONLY_COMMANDS = frozenset({
+    CMD_GET_VERSION,
+    CMD_GET_BRIGHTNESS,
+    CMD_GET_BACKLIGHT_TIMEOUT,
+    CMD_GET_IDLE_INTERVAL,
+    CMD_GET_CURRENCY,
+    CMD_GET_LAYOUT,
+    CMD_GET_STATUS,
+})
+
+BEHAVIOR_FLAGS: tuple[tuple[int, str], ...] = (
+    (0x01, "alt_sticky"),
+    (0x02, "shift_sticky"),
+    (0x04, "led"),
+    (0x08, "soft_return"),
+    (0x10, "accs_stop"),
+    (0x20, "led_switch"),
+    (0x40, "tab_to_ctrl"),
+    (0x80, "cursor_mode"),
+)
+FLAG_BY_NAME = {name: bit for bit, name in BEHAVIOR_FLAGS}
+
+CURRENCY_NAMES = {0: "dollar", 1: "cent", 2: "pound", 3: "euro", 4: "rmb"}
+CURRENCY_BY_NAME = {name: code for code, name in CURRENCY_NAMES.items()}
+
+LAYOUT_NAMES = {0x20: "br", 0x21: "us"}
+LAYOUT_BY_NAME = {name: code for code, name in LAYOUT_NAMES.items()}
+
+
+# --- iAP2 codec ---
+
+def iap2_checksum(data: bytes) -> int:
+    return (-sum(data)) & 0xFF
+
+
+@dataclass(frozen=True)
+class LinkPacket:
+    control: int
+    seq: int
+    ack: int
+    session: int
+    payload: bytes = b""
+
+    def encode(self) -> bytes:
+        total_len = 9 + (len(self.payload) + 1 if self.payload else 0)
+        hdr = bytearray(
+            struct.pack(">2sHBBBB", LINK_SYNC_MAGIC, total_len, self.control, self.seq, self.ack, self.session)
+        )
+        hdr.append(iap2_checksum(hdr))
+        if not self.payload:
+            return bytes(hdr)
+        return bytes(hdr) + self.payload + bytes([iap2_checksum(self.payload)])
+
+    @classmethod
+    def decode(cls, data: bytes) -> "LinkPacket":
+        if len(data) < 9:
+            raise ValueError(f"link packet too short: {len(data)} bytes")
+        if data[:2] != LINK_SYNC_MAGIC:
+            raise ValueError(f"bad link magic: {data[:2].hex(' ')}")
+        total_len, ctrl, seq, ack, session = struct.unpack(">HBBBB", data[2:8])
+        if len(data) < total_len or total_len < 9:
+            raise ValueError(f"invalid link length {total_len} for {len(data)} bytes")
+        if iap2_checksum(data[:8]) != data[8]:
+            raise ValueError("bad link header checksum")
+        if total_len == 9:
+            return cls(ctrl, seq, ack, session, b"")
+        payload = data[9 : total_len - 1]
+        if iap2_checksum(payload) != data[total_len - 1]:
+            raise ValueError("bad link payload checksum")
+        return cls(ctrl, seq, ack, session, payload)
+
+
+def encode_link_sync(seq: int = 0, ack: int = 0, *, syn_ack: bool = False) -> bytes:
+    payload = struct.pack(">BBHHHBBBBB", 1, 5, 4096, 2000, 500, 30, 3, SESSION_CONTROL, 0, 1)
+    ctrl = CTRL_SYN | (CTRL_ACK if syn_ack else 0)
+    return LinkPacket(ctrl, seq, ack, 0x00, payload).encode()
+
+
+@dataclass(frozen=True)
+class ControlMessage:
+    msg_type: int
+    kvps: tuple[tuple[int, bytes], ...] = ()
+
+    def encode(self) -> bytes:
+        body = bytearray()
+        for k_id, val in self.kvps:
+            body.extend(struct.pack(">HH", len(val) + 4, k_id))
+            body.extend(val)
+        total_len = len(body) + 6
+        return struct.pack(">2sHH", CTRL_SYNC_MAGIC, total_len, self.msg_type) + bytes(body)
+
+    @classmethod
+    def decode(cls, data: bytes) -> "ControlMessage":
+        if len(data) < 6 or data[:2] != CTRL_SYNC_MAGIC:
+            raise ValueError(f"bad control message header: {data[:6].hex(' ')}")
+        total_len, msg_type = struct.unpack(">HH", data[2:6])
+        if len(data) < total_len or total_len < 6:
+            raise ValueError(f"truncated control message: {len(data)} < {total_len}")
+        kvps: list[tuple[int, bytes]] = []
+        pos = 6
+        while pos < total_len:
+            if pos + 4 > total_len:
+                raise ValueError("truncated KVP header")
+            entry_len, k_id = struct.unpack(">HH", data[pos : pos + 4])
+            if entry_len < 4 or pos + entry_len > total_len:
+                raise ValueError(f"invalid KVP length {entry_len}")
+            kvps.append((k_id, data[pos + 4 : pos + entry_len]))
+            pos += entry_len
+        return cls(msg_type, tuple(kvps))
+
+
+# --- Companion codec ---
+
+@dataclass(frozen=True)
+class CompanionReply:
+    cmd: int
+    status: int
+    payload: bytes
+
+    @classmethod
+    def decode(cls, data: bytes, expected_cmd: int | None = None) -> "CompanionReply":
+        if len(data) < 4:
+            raise ValueError(f"reply too short: {data.hex(' ')}")
+        length, msg_type, cmd, status = data[0], data[1], data[2], data[3]
+        if msg_type != 0x02:
+            raise ValueError(f"unexpected reply type 0x{msg_type:02x}")
+        if len(data) < length:
+            raise ValueError(f"truncated reply: expected {length}, got {len(data)}")
+        if expected_cmd is not None and cmd != expected_cmd:
+            raise ValueError(f"command mismatch: expected 0x{expected_cmd:02x}, got 0x{cmd:02x}")
+        return cls(cmd, status, data[4:length])
+
+
+def encode_getter(cmd: int) -> bytes:
+    if cmd == CMD_FLAGS:
+        return bytes((0x04, CMD_FLAGS, 0x00, 0x00))
+    if cmd not in READ_ONLY_COMMANDS:
+        raise ValueError(f"0x{cmd:02x} is not an allowlisted read-only command")
+    return bytes((0x02, cmd))
+
+
+def encode_set_brightness(value: int, *, temp: bool = False) -> bytes:
+    if not 0 <= value <= 255:
+        raise ValueError(f"brightness must be 0..255, got {value}")
+    return bytes((0x03, CMD_SET_BRIGHTNESS_TEMP if temp else CMD_SET_BRIGHTNESS, value))
+
+
+def encode_set_flags(mask: int, bits: int) -> bytes:
+    if not (0 <= mask <= 255 and 0 <= bits <= 255):
+        raise ValueError("mask and bits must be 0..255")
+    if bits & ~mask:
+        raise ValueError("bits cannot have bits set outside mask")
+    return bytes((0x04, CMD_FLAGS, mask, bits))
+
+
+def encode_set_backlight_timeout(ms: int) -> bytes:
+    if not 1000 <= ms <= 65535:
+        raise ValueError(f"backlight timeout must be 1000..65535 ms, got {ms}")
+    return bytes((0x04, CMD_SET_BACKLIGHT_TIMEOUT)) + struct.pack(">H", ms)
+
+
+def encode_set_idle_interval(seconds: int, *, min_seconds: int = 1) -> bytes:
+    if not min_seconds <= seconds <= 65535:
+        raise ValueError(f"idle interval must be {min_seconds}..65535 s, got {seconds}")
+    return bytes((0x04, CMD_SET_IDLE_INTERVAL)) + struct.pack(">H", seconds)
+
+
+def encode_set_currency(value: int) -> bytes:
+    if value not in CURRENCY_NAMES:
+        raise ValueError(f"currency must be 0..4, got {value}")
+    return bytes((0x03, CMD_SET_CURRENCY, value))
+
+
+def encode_set_layout(value: int) -> bytes:
+    if value not in LAYOUT_NAMES:
+        raise ValueError(f"layout must be 0x20 (br) or 0x21 (us), got 0x{value:02x}")
+    return bytes((0x03, CMD_SET_LAYOUT, value))
+
+
+def decode_flags(byte_val: int) -> dict[str, bool]:
+    return {name: bool(byte_val & bit) for bit, name in BEHAVIOR_FLAGS}
+
+
+# --- USB / iAP2 transport ---
+
+def list_devices() -> list[dict]:
+    out = []
+    for d in usb.core.find(find_all=True, idVendor=VID, idProduct=PID):
+        try:
+            serial = usb.util.get_string(d, d.iSerialNumber) or ""
+        except Exception:
+            serial = ""
+        try:
+            product = usb.util.get_string(d, d.iProduct) or ""
+        except Exception:
+            product = ""
+        out.append({
+            "bus": d.bus,
+            "address": d.address,
+            "serial": serial,
+            "product": product,
+            "bcdDevice": f"{(d.bcdDevice >> 8) & 0xff}.{d.bcdDevice & 0xff:02x}",
+        })
+    return out
+
+
+class ClicksSession:
+    def __init__(self, serial: str | None = None, *, timeout_ms: int = 1000):
+        self.serial = serial
+        self.timeout_ms = timeout_ms
+        self.dev: usb.core.Device | None = None
+        self.actual_serial: str = ""
+        self.ident: dict[int, bytes] = {}
+        self._host_seq = 1
+        self._dev_seq = 0
+        self._claimed: list[int] = []
+        self._debug = os.environ.get("CLICKS_DEBUG", "") == "1"
+
+    def _log(self, msg: str) -> None:
+        if self._debug:
+            print(msg, file=sys.stderr)
+
+    def _read(self, ep: int, timeout_ms: int | None = None) -> bytes | None:
+        assert self.dev is not None
+        try:
+            data = bytes(self.dev.read(ep, 512, timeout=timeout_ms or self.timeout_ms))
+            self._log(f"IN  0x{ep:02x}: {data.hex(' ')}")
+            return data
+        except usb.core.USBTimeoutError:
+            return None
+
+    def _write(self, ep: int, data: bytes) -> None:
+        assert self.dev is not None
+        self._log(f"OUT 0x{ep:02x}: {data.hex(' ')}")
+        self.dev.write(ep, data, timeout=self.timeout_ms)
+
+    def _send_ctrl(self, msg: ControlMessage, *, expect_reply: bool = False) -> list[ControlMessage]:
+        sent_seq = self._host_seq
+        lp = LinkPacket(
+            CTRL_ACK, seq=sent_seq, ack=self._dev_seq, session=SESSION_CONTROL, payload=msg.encode()
+        ).encode()
+        self._host_seq = (self._host_seq + 1) & 0xFF
+        self._write(0x02, lp)
+
+        replies: list[ControlMessage] = []
+        acked = False
+        t_end = time.monotonic() + 1.5
+        while time.monotonic() < t_end:
+            r = self._read(0x82, 200)
+            if not r:
+                if replies or (acked and not expect_reply):
+                    break
+                continue
+            if r.startswith(b"\xff\x5a"):
+                rlp = LinkPacket.decode(r)
+                if rlp.ack == sent_seq:
+                    acked = True
+                if rlp.payload:
+                    self._dev_seq = rlp.seq
+                    ack_only = LinkPacket(CTRL_ACK, seq=sent_seq, ack=self._dev_seq, session=0).encode()
+                    self._write(0x02, ack_only)
+                    if rlp.payload.startswith(b"\x40\x40"):
+                        replies.append(ControlMessage.decode(rlp.payload))
+                elif acked and not expect_reply:
+                    break
+        return replies
+
+    def __enter__(self) -> "ClicksSession":
+        devs = list(usb.core.find(find_all=True, idVendor=VID, idProduct=PID))
+        if not devs:
+            raise RuntimeError(f"No Clicks device ({VID:04x}:{PID:04x}) found")
+        if self.serial:
+            devs = [d for d in devs if (usb.util.get_string(d, d.iSerialNumber) or "") == self.serial]
+            if not devs:
+                raise RuntimeError(f"Clicks device with serial {self.serial!r} not found")
+        elif len(devs) > 1:
+            raise RuntimeError("Multiple Clicks devices connected; specify --serial")
+
+        self.dev = devs[0]
+        self.actual_serial = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
+
+        for iface in (0, 1):
+            try:
+                if self.dev.is_kernel_driver_active(iface):
+                    self.dev.detach_kernel_driver(iface)
+            except Exception:
+                pass
+
+        try:
+            self.dev.reset()
+        except Exception:
+            pass
+
+        usb.util.claim_interface(self.dev, 0)
+        self._claimed.append(0)
+
+        while self._read(0x82, 30) is not None:
+            pass
+        rst = LinkPacket(CTRL_RST, seq=0, ack=0, session=0).encode()
+        self._write(0x02, rst)
+        time.sleep(0.05)
+        while self._read(0x82, 30) is not None:
+            pass
+
+        self._write(0x02, ATTACH_HANDSHAKE)
+        t_att = time.monotonic() + 0.6
+        while time.monotonic() < t_att:
+            pkt = self._read(0x82, 200)
+            if pkt == ATTACH_HANDSHAKE:
+                break
+
+        syn = encode_link_sync(seq=0, ack=0)
+        self._write(0x02, syn)
+
+        synced = False
+        for _ in range(12):
+            pkt = self._read(0x82, 400)
+            if not pkt:
+                continue
+            if pkt == ATTACH_HANDSHAKE:
+                self._write(0x02, ATTACH_HANDSHAKE)
+                continue
+            if pkt.startswith(b"\xff\x5a"):
+                lp = LinkPacket.decode(pkt)
+                if lp.control & CTRL_SYN:
+                    self._dev_seq = lp.seq
+                    self._write(0x02, LinkPacket(CTRL_ACK, seq=1, ack=self._dev_seq, session=0).encode())
+                    self._host_seq = 1
+                    synced = True
+                    break
+                if lp.control == CTRL_ACK:
+                    self._write(0x02, rst)
+                    time.sleep(0.05)
+                    self._write(0x02, syn)
+
+        if not synced:
+            raise RuntimeError("iAP2 LinkSync failed")
+
+        for msg in self._send_ctrl(ControlMessage(MSG_REQUEST_IDENTIFY), expect_reply=True):
+            if msg.msg_type == MSG_IDENTIFY:
+                self.ident = dict(msg.kvps)
+
+        self._send_ctrl(ControlMessage(MSG_AUTH_ACCEPTED))
+        self._send_ctrl(ControlMessage(MSG_SESSION_OPEN), expect_reply=True)
+        self._send_ctrl(ControlMessage(MSG_START_POWER_UPDATES))
+        self._send_ctrl(ControlMessage(MSG_EA_OPEN, ((0, b"\x01"), (1, b"\x00\x01"))))
+
+        usb.util.claim_interface(self.dev, 1)
+        self._claimed.append(1)
+        self.dev.set_interface_altsetting(interface=1, alternate_setting=1)
+        time.sleep(0.05)
+        while self._read(0x83, 20) is not None:
+            pass
+        return self
+
+    def transact(self, frame: bytes, expected_cmd: int) -> CompanionReply:
+        self._write(0x03, frame)
+        resp = self._read(0x83, self.timeout_ms)
+        if resp is None:
+            raise TimeoutError(f"Timeout waiting for reply to 0x{expected_cmd:02x}")
+        return CompanionReply.decode(resp, expected_cmd)
+
+    def __exit__(self, *exc) -> None:
+        if self.dev is not None:
+            if 0 in self._claimed:
+                try:
+                    self._send_ctrl(ControlMessage(MSG_EA_CLOSE, ((0, b"\x00\x01"),)))
+                except Exception:
+                    pass
+                try:
+                    self._write(0x02, LinkPacket(CTRL_RST, seq=0, ack=0, session=0).encode())
+                except Exception:
+                    pass
+            for iface in reversed(self._claimed):
+                try:
+                    usb.util.release_interface(self.dev, iface)
+                except Exception:
+                    pass
+            self._claimed.clear()
+
+
+# --- CLI ---
+
+def read_all_settings(sess: ClicksSession) -> dict:
+    ver = sess.transact(encode_getter(CMD_GET_VERSION), CMD_GET_VERSION).payload
+    bri = sess.transact(encode_getter(CMD_GET_BRIGHTNESS), CMD_GET_BRIGHTNESS).payload[0]
+    flg = sess.transact(encode_getter(CMD_FLAGS), CMD_FLAGS).payload[0]
+    tmo = struct.unpack(">H", sess.transact(encode_getter(CMD_GET_BACKLIGHT_TIMEOUT), CMD_GET_BACKLIGHT_TIMEOUT).payload)[0]
+    idl = struct.unpack(">H", sess.transact(encode_getter(CMD_GET_IDLE_INTERVAL), CMD_GET_IDLE_INTERVAL).payload)[0]
+    cur = sess.transact(encode_getter(CMD_GET_CURRENCY), CMD_GET_CURRENCY).payload[0]
+    lay = sess.transact(encode_getter(CMD_GET_LAYOUT), CMD_GET_LAYOUT).payload[0]
+    sta = sess.transact(encode_getter(CMD_GET_STATUS), CMD_GET_STATUS).payload[0]
+    model = sess.ident.get(1, b"").rstrip(b"\x00").decode("ascii", "replace")
+    return {
+        "serial": sess.actual_serial,
+        "model": model,
+        "hardware": f"{ver[0]}.{ver[1]}",
+        "firmware": f"{ver[2]}.{ver[3]:02x}",
+        "brightness": bri,
+        "backlight_timeout_ms": tmo,
+        "idle_interval_s": idl,
+        "currency": CURRENCY_NAMES.get(cur, cur),
+        "currency_code": cur,
+        "layout": LAYOUT_NAMES.get(lay, f"0x{lay:02x}"),
+        "layout_code": lay,
+        "flags_byte": flg,
+        "flags": decode_flags(flg),
+        "status_flags": sta,
+    }
+
+
+def cmd_list(_: argparse.Namespace) -> int:
+    devs = list_devices()
+    if not devs:
+        print("No Clicks keyboards found.")
+        return 1
+    for d in devs:
+        print(f"bus={d['bus']:03d} addr={d['address']:03d} serial={d['serial']} fw={d['bcdDevice']} {d['product']}")
+    return 0
+
+
+def cmd_get(args: argparse.Namespace) -> int:
+    with ClicksSession(args.serial) as sess:
+        state = read_all_settings(sess)
+    if args.backup:
+        Path(args.backup).write_text(json.dumps(state, indent=2) + "\n")
+        print(f"Saved backup to {args.backup}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(state, indent=2))
+        return 0
+    print(f"Device:            {state['model']} serial={state['serial']} hw={state['hardware']} fw={state['firmware']}")
+    print(f"Brightness:        {state['brightness']} (0x{state['brightness']:02x})")
+    print(f"Backlight timeout: {state['backlight_timeout_ms']} ms")
+    print(f"Idle interval:     {state['idle_interval_s']} s")
+    print(f"Currency key:      {state['currency']} (0x{state['currency_code']:02x})")
+    print(f"Layout region:     {state['layout']} (0x{state['layout_code']:02x})")
+    on = [k for k, v in state["flags"].items() if v]
+    off = [k for k, v in state["flags"].items() if not v]
+    print(f"Behavior flags:    0x{state['flags_byte']:02x}")
+    print(f"  ON:  {', '.join(on) if on else '(none)'}")
+    print(f"  OFF: {', '.join(off) if off else '(none)'}")
+    print(f"Status flags:      0x{state['status_flags']:02x}")
+    return 0
+
+
+def parse_currency(val: str) -> int:
+    low = val.lower()
+    return CURRENCY_BY_NAME[low] if low in CURRENCY_BY_NAME else int(val, 0)
+
+
+def parse_layout(val: str) -> int:
+    low = val.lower()
+    return LAYOUT_BY_NAME[low] if low in LAYOUT_BY_NAME else int(val, 0)
+
+
+def apply_changes(
+    sess: ClicksSession,
+    cur: dict,
+    *,
+    brightness: int | None = None,
+    temp_brightness: int | None = None,
+    timeout_ms: int | None = None,
+    idle_s: int | None = None,
+    currency: int | None = None,
+    layout: int | None = None,
+    flag_updates: dict[str, bool] | None = None,
+    dry_run: bool = False,
+) -> None:
+    ops: list[tuple[str, int, bytes]] = []
+
+    if temp_brightness is not None:
+        ops.append((f"temp brightness -> {temp_brightness}", CMD_SET_BRIGHTNESS_TEMP, encode_set_brightness(temp_brightness, temp=True)))
+    if brightness is not None and brightness != cur["brightness"]:
+        ops.append((f"brightness {cur['brightness']} -> {brightness}", CMD_SET_BRIGHTNESS, encode_set_brightness(brightness)))
+
+    eff_tmo = timeout_ms if timeout_ms is not None else cur["backlight_timeout_ms"]
+    eff_idle = idle_s if idle_s is not None else cur["idle_interval_s"]
+    if eff_idle < max(1, eff_tmo // 1000):
+        raise ValueError(f"idle interval ({eff_idle} s) must be >= backlight timeout ({eff_tmo // 1000} s)")
+
+    if timeout_ms is not None and timeout_ms != cur["backlight_timeout_ms"]:
+        ops.append((f"backlight timeout {cur['backlight_timeout_ms']} -> {timeout_ms} ms", CMD_SET_BACKLIGHT_TIMEOUT, encode_set_backlight_timeout(timeout_ms)))
+
+    if idle_s is not None and idle_s != cur["idle_interval_s"]:
+        ops.append((
+            f"idle interval {cur['idle_interval_s']} -> {idle_s} s",
+            CMD_SET_IDLE_INTERVAL,
+            encode_set_idle_interval(idle_s, min_seconds=max(1, eff_tmo // 1000)),
+        ))
+
+    if currency is not None and currency != cur["currency_code"]:
+        ops.append((f"currency {cur['currency']} -> {CURRENCY_NAMES[currency]}", CMD_SET_CURRENCY, encode_set_currency(currency)))
+
+    if layout is not None and layout != cur["layout_code"]:
+        ops.append((f"layout {cur['layout']} -> {LAYOUT_NAMES[layout]}", CMD_SET_LAYOUT, encode_set_layout(layout)))
+
+    if flag_updates:
+        mask = 0
+        bits = 0
+        for name, val in flag_updates.items():
+            if name not in FLAG_BY_NAME:
+                raise ValueError(f"unknown flag {name!r}; valid: {', '.join(FLAG_BY_NAME)}")
+            bit = FLAG_BY_NAME[name]
+            if bool(cur["flags_byte"] & bit) != val:
+                mask |= bit
+                if val:
+                    bits |= bit
+        if mask:
+            ops.append((f"flags mask=0x{mask:02x} bits=0x{bits:02x}", CMD_FLAGS, encode_set_flags(mask, bits)))
+
+    if not ops:
+        print("No changes needed (device already matches requested settings).")
+        return
+
+    for desc, cmd, frame in ops:
+        if dry_run:
+            print(f"[dry-run] {desc}: {frame.hex(' ')}")
+        else:
+            rep = sess.transact(frame, cmd)
+            if rep.status != 0x00:
+                raise RuntimeError(f"Failed {desc}: status=0x{rep.status:02x}")
+            print(f"Applied: {desc}")
+
+
+def cmd_set(args: argparse.Namespace) -> int:
+    flag_updates: dict[str, bool] = {}
+    for item in args.flag or []:
+        if "=" not in item:
+            raise SystemExit(f"--flag must be NAME=on|off, got {item!r}")
+        name, val = item.split("=", 1)
+        if val.lower() in ("1", "on", "true", "yes"):
+            flag_updates[name] = True
+        elif val.lower() in ("0", "off", "false", "no"):
+            flag_updates[name] = False
+        else:
+            raise SystemExit(f"Invalid flag value {val!r} for {name}")
+
+    with ClicksSession(args.serial) as sess:
+        cur = read_all_settings(sess)
+        apply_changes(
+            sess,
+            cur,
+            brightness=args.brightness,
+            temp_brightness=args.temp_brightness,
+            timeout_ms=args.timeout,
+            idle_s=args.idle,
+            currency=parse_currency(args.currency) if args.currency is not None else None,
+            layout=parse_layout(args.layout) if args.layout is not None else None,
+            flag_updates=flag_updates,
+            dry_run=args.dry_run,
+        )
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    data = json.loads(Path(args.file).read_text())
+    with ClicksSession(args.serial) as sess:
+        cur = read_all_settings(sess)
+        apply_changes(
+            sess,
+            cur,
+            brightness=data.get("brightness"),
+            timeout_ms=data.get("backlight_timeout_ms"),
+            idle_s=data.get("idle_interval_s"),
+            currency=data.get("currency_code"),
+            layout=data.get("layout_code"),
+            flag_updates=data.get("flags"),
+            dry_run=args.dry_run,
+        )
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="clicksctl", description="Clicks Keyboard Linux settings CLI")
+    sub = p.add_subparsers(dest="command", required=True)
+
+    sp_list = sub.add_parser("list", help="List connected Clicks keyboards")
+    sp_list.set_defaults(func=cmd_list)
+
+    sp_get = sub.add_parser("get", help="Read all current settings")
+    sp_get.add_argument("--serial", help="Device serial number")
+    sp_get.add_argument("--json", action="store_true", help="Output JSON")
+    sp_get.add_argument("--backup", metavar="FILE", help="Save settings JSON snapshot")
+    sp_get.set_defaults(func=cmd_get)
+
+    sp_set = sub.add_parser("set", help="Update one or more settings (skips unchanged)")
+    sp_set.add_argument("--serial", help="Device serial number")
+    sp_set.add_argument("--dry-run", action="store_true", help="Show packets without writing")
+    sp_set.add_argument("--brightness", type=int, help="Persistent brightness (0..255)")
+    sp_set.add_argument("--temp-brightness", type=int, help="Temporary RAM brightness (0..255)")
+    sp_set.add_argument("--timeout", type=int, help="Backlight timeout in ms (>=1000)")
+    sp_set.add_argument("--idle", type=int, help="Accessory idle interval in seconds (>=timeout/1000)")
+    sp_set.add_argument("--currency", help="dollar|cent|pound|euro|rmb or 0..4")
+    sp_set.add_argument("--layout", help="us|br or 0x21|0x20")
+    sp_set.add_argument("--flag", action="append", help=f"NAME=on|off ({', '.join(n for _, n in BEHAVIOR_FLAGS)})")
+    sp_set.set_defaults(func=cmd_set)
+
+    sp_res = sub.add_parser("restore", help="Restore settings from a JSON backup")
+    sp_res.add_argument("file", help="Backup JSON file")
+    sp_res.add_argument("--serial", help="Device serial number")
+    sp_res.add_argument("--dry-run", action="store_true", help="Show packets without writing")
+    sp_res.set_defaults(func=cmd_restore)
+    return p
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
