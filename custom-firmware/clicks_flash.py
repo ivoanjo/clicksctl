@@ -29,7 +29,15 @@ _SPEC.loader.exec_module(_clicksctl)
 CMD_GET_IDLE_INTERVAL = _clicksctl.CMD_GET_IDLE_INTERVAL
 CMD_GET_VERSION = _clicksctl.CMD_GET_VERSION
 ClicksSession = _clicksctl.ClicksSession
+CompanionReply = _clicksctl.CompanionReply
 encode_getter = _clicksctl.encode_getter
+usb = _clicksctl.usb
+
+RECOVERY_VID = 0x352E
+RECOVERY_PID = 0x2307
+RECOVERY_EP_IN = 0x81
+RECOVERY_EP_OUT = 0x01
+RECOVERY_PKT_SIZE = 64
 
 HERE = Path(__file__).resolve().parent
 
@@ -90,11 +98,108 @@ def load_image(path: Path, expected_sha256: str | None) -> tuple[bytes, str]:
     return image, digest
 
 
+class RecoverySession:
+    """Plain 64-byte Vendor HID session for CK-6100 bootloader recovery (352e:2307)."""
+
+    def __init__(self, serial: str | None = None, *, timeout_ms: int = 2000):
+        self.serial = serial
+        self.timeout_ms = timeout_ms
+        self.dev = None
+        self.actual_serial = ""
+        self._detached = False
+
+    def __enter__(self) -> "RecoverySession":
+        devs = list(usb.core.find(find_all=True, idVendor=RECOVERY_VID, idProduct=RECOVERY_PID))
+        if not devs:
+            raise RuntimeError(f"No CK-6100 bootloader recovery device ({RECOVERY_VID:04x}:{RECOVERY_PID:04x}) found")
+        if self.serial is not None:
+            matched = [d for d in devs if (usb.util.get_string(d, d.iSerialNumber) or "") == self.serial]
+            if not matched:
+                raise RuntimeError(f"No recovery device with serial {self.serial!r}")
+            self.dev = matched[0]
+        elif len(devs) > 1:
+            raise RuntimeError("Multiple recovery devices found; pass --serial")
+        else:
+            self.dev = devs[0]
+        self.actual_serial = usb.util.get_string(self.dev, self.dev.iSerialNumber) or ""
+        try:
+            if self.dev.is_kernel_driver_active(0):
+                self.dev.detach_kernel_driver(0)
+                self._detached = True
+        except (NotImplementedError, usb.core.USBError):
+            pass
+        usb.util.claim_interface(self.dev, 0)
+        return self
+
+    def _write(self, ep: int, frame: bytes) -> None:
+        assert self.dev is not None
+        if len(frame) > RECOVERY_PKT_SIZE:
+            raise ValueError(f"frame too large ({len(frame)} > {RECOVERY_PKT_SIZE})")
+        self.dev.write(ep, frame.ljust(RECOVERY_PKT_SIZE, b"\x00"), timeout=self.timeout_ms)
+
+    def transact(self, frame: bytes, expected_cmd: int):
+        assert self.dev is not None
+        self._write(RECOVERY_EP_OUT, frame)
+        resp = bytes(self.dev.read(RECOVERY_EP_IN, RECOVERY_PKT_SIZE, timeout=self.timeout_ms))
+        return CompanionReply.decode(resp, expected_cmd)
+
+    def __exit__(self, *exc) -> None:
+        if self.dev is not None:
+            try:
+                usb.util.release_interface(self.dev, 0)
+            except Exception:
+                pass
+            if self._detached:
+                try:
+                    self.dev.attach_kernel_driver(0)
+                except Exception:
+                    pass
+
+
+def flash_image(sess, image: bytes, *, reboot_ep: int, no_reboot: bool) -> None:
+    # 1. A1 begin
+    rep = sess.transact(pkt_begin(len(image)), CMD_FW_BEGIN)
+    if rep.status != 0x00 or len(rep.payload) != 4:
+        raise RuntimeError(f"A1 rejected: status=0x{rep.status:02x} payload={rep.payload.hex(' ')}")
+    max_sz = struct.unpack(">I", rep.payload)[0]
+    if len(image) > max_sz:
+        raise RuntimeError(f"Device max size {max_sz} < image size {len(image)}")
+    print(f"A1 accepted (device max=0x{max_sz:x})")
+
+    # 2. A2 32-byte chunks
+    for offset in range(0, len(image), CHUNK_SIZE):
+        chunk = image[offset : offset + CHUNK_SIZE]
+        rep = sess.transact(pkt_data(offset, chunk), CMD_FW_DATA)
+        if rep.status != 0x00 or len(rep.payload) != 4:
+            raise RuntimeError(f"A2 failed at 0x{offset:x}: status=0x{rep.status:02x}")
+        next_off = struct.unpack(">I", rep.payload)[0]
+        if next_off != offset + len(chunk):
+            raise RuntimeError(f"A2 offset mismatch: expected 0x{offset + len(chunk):x}, got 0x{next_off:x}")
+        if offset % (CHUNK_SIZE * 64) == 0 or offset + len(chunk) == len(image):
+            print(f"A2 {offset + len(chunk)}/{len(image)} bytes")
+
+    # 3. A3 commit
+    rep = sess.transact(pkt_commit(len(image)), CMD_FW_COMMIT)
+    if rep.status != 0x00 or len(rep.payload) != 4:
+        raise RuntimeError(f"A3 commit failed: status=0x{rep.status:02x}")
+    committed = struct.unpack(">I", rep.payload)[0]
+    print(f"A3 committed ({committed} bytes)")
+
+    # 4. A0 reboot
+    if no_reboot:
+        print("Skipped A0 reboot (--no-reboot).")
+    else:
+        print("Sending A0 reboot...")
+        sess._write(reboot_ep, pkt_reboot())
+        time.sleep(0.25)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="CK-6100 firmware flasher (dry-run by default)")
     ap.add_argument("--serial", default=None, help="Target USB serial (required if multiple devices are attached)")
     ap.add_argument("--target", choices=sorted(CK6100_IMAGES), help="Known firmware target (verifies SHA-256)")
     ap.add_argument("--image", type=Path, help="Path to firmware .bin")
+    ap.add_argument("--recovery", action="store_true", help="Flash via 352e:2307 bootloader HID recovery mode (no iAP2)")
     ap.add_argument("--allow-downgrade", action="store_true", help="Allow flashing 1.20 onto 1.22")
     ap.add_argument("--allow-low-idle", action="store_true", help=f"Allow flashing when device idle < {MIN_SAFE_IDLE_S} s")
     ap.add_argument("--plan-only", action="store_true", help="Verify image & print packet plan offline (no USB)")
@@ -130,6 +235,16 @@ def main() -> int:
     if args.flash and args.confirm != "CK-6100":
         raise SystemExit("Refusing --flash without --confirm CK-6100")
 
+    if args.recovery:
+        with RecoverySession(args.serial, timeout_ms=2000) as sess:
+            ver = sess.transact(encode_getter(CMD_GET_VERSION), CMD_GET_VERSION).payload
+            print(f"Recovery device: serial={sess.actual_serial} raw_ver={ver.hex(' ')}")
+            if not args.flash:
+                print("Dry-run complete (recovery pre-flight passed, no A1/A2/A3/A0 packets sent).")
+                return 0
+            flash_image(sess, image, reboot_ep=RECOVERY_EP_OUT, no_reboot=args.no_reboot)
+        return 0
+
     with ClicksSession(args.serial, timeout_ms=2000) as sess:
         model = sess.ident.get(1, b"").rstrip(b"\x00").decode("ascii", "replace")
         hw_str = sess.ident.get(5, b"").rstrip(b"\x00").decode("ascii", "replace")
@@ -155,41 +270,7 @@ def main() -> int:
             print("Dry-run complete (pre-flight checks passed, no A1/A2/A3/A0 packets sent).")
             return 0
 
-        # 1. A1 begin
-        rep = sess.transact(pkt_begin(len(image)), CMD_FW_BEGIN)
-        if rep.status != 0x00 or len(rep.payload) != 4:
-            raise RuntimeError(f"A1 rejected: status=0x{rep.status:02x} payload={rep.payload.hex(' ')}")
-        max_sz = struct.unpack(">I", rep.payload)[0]
-        if len(image) > max_sz:
-            raise RuntimeError(f"Device max size {max_sz} < image size {len(image)}")
-        print(f"A1 accepted (device max=0x{max_sz:x})")
-
-        # 2. A2 32-byte chunks
-        for offset in range(0, len(image), CHUNK_SIZE):
-            chunk = image[offset : offset + CHUNK_SIZE]
-            rep = sess.transact(pkt_data(offset, chunk), CMD_FW_DATA)
-            if rep.status != 0x00 or len(rep.payload) != 4:
-                raise RuntimeError(f"A2 failed at 0x{offset:x}: status=0x{rep.status:02x}")
-            next_off = struct.unpack(">I", rep.payload)[0]
-            if next_off != offset + len(chunk):
-                raise RuntimeError(f"A2 offset mismatch: expected 0x{offset + len(chunk):x}, got 0x{next_off:x}")
-            if offset % (CHUNK_SIZE * 64) == 0 or offset + len(chunk) == len(image):
-                print(f"A2 {offset + len(chunk)}/{len(image)} bytes")
-
-        # 3. A3 commit
-        rep = sess.transact(pkt_commit(len(image)), CMD_FW_COMMIT)
-        if rep.status != 0x00 or len(rep.payload) != 4:
-            raise RuntimeError(f"A3 commit failed: status=0x{rep.status:02x}")
-        committed = struct.unpack(">I", rep.payload)[0]
-        print(f"A3 committed ({committed} bytes)")
-
-        # 4. A0 reboot
-        if args.no_reboot:
-            print("Skipped A0 reboot (--no-reboot).")
-        else:
-            print("Sending A0 reboot...")
-            sess._write(0x03, pkt_reboot())
-            time.sleep(0.25)
+        flash_image(sess, image, reboot_ep=0x03, no_reboot=args.no_reboot)
     return 0
 
 
