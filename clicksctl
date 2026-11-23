@@ -424,10 +424,18 @@ class ClicksSession:
 
     def transact(self, frame: bytes, expected_cmd: int) -> CompanionReply:
         self._write(0x03, frame)
-        resp = self._read(0x83, self.timeout_ms)
-        if resp is None:
-            raise TimeoutError(f"Timeout waiting for reply to 0x{expected_cmd:02x}")
-        return CompanionReply.decode(resp, expected_cmd)
+        deadline = time.monotonic() + self.timeout_ms / 1000.0
+        while True:
+            rem_ms = max(1, int((deadline - time.monotonic()) * 1000))
+            resp = self._read(0x83, rem_ms)
+            if resp is None:
+                raise TimeoutError(f"Timeout waiting for reply to 0x{expected_cmd:02x}")
+            if expected_cmd != 0x00 and len(resp) >= 4 and resp[1] == 0x02 and resp[2] == 0x00:
+                self._log(f"SKIP async 0x00: {resp.hex(' ')}")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timeout waiting for reply to 0x{expected_cmd:02x}")
+                continue
+            return CompanionReply.decode(resp, expected_cmd)
 
     def __exit__(self, *exc) -> None:
         if self.dev is not None:
@@ -551,6 +559,8 @@ def apply_changes(
         ops.append((f"backlight timeout {cur['backlight_timeout_ms']} -> {timeout_ms} ms", CMD_SET_BACKLIGHT_TIMEOUT, encode_set_backlight_timeout(timeout_ms)))
 
     if idle_s is not None and idle_s != cur["idle_interval_s"]:
+        if idle_s < 15:
+            print(f"Warning: idle interval {idle_s} s is very short and may cause USB sessions to sleep quickly.", file=sys.stderr)
         ops.append((
             f"idle interval {cur['idle_interval_s']} -> {idle_s} s",
             CMD_SET_IDLE_INTERVAL,
