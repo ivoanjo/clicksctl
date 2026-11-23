@@ -4,7 +4,8 @@
 SAFETY:
 - Dry-run by default; sends ZERO A0-A3 packets unless --flash --confirm CK-6100 is passed.
 - Verifies device reports model=CK-6100 and hw=3.0.0 before flashing.
-- Enforces image size <= 0x6A00 (27,136 bytes), and verifies SHA-256 when --target is used.
+- Enforces image size <= 0x69FF (27,135 bytes, bootloader copier limit) and verifies SHA-256 when --target is used.
+- Guards against low idle intervals (< 30 s) unless --allow-low-idle is passed.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ _clicksctl = importlib.util.module_from_spec(_SPEC)
 sys.modules["clicksctl"] = _clicksctl
 _SPEC.loader.exec_module(_clicksctl)
 
+CMD_GET_IDLE_INTERVAL = _clicksctl.CMD_GET_IDLE_INTERVAL
 CMD_GET_VERSION = _clicksctl.CMD_GET_VERSION
 ClicksSession = _clicksctl.ClicksSession
 encode_getter = _clicksctl.encode_getter
@@ -46,7 +48,8 @@ CK6100_IMAGES = {
     ),
 }
 
-MAX_IMAGE_SIZE = 0x6A00
+MAX_IMAGE_SIZE = 0x69FF
+MIN_SAFE_IDLE_S = 30
 CHUNK_SIZE = 32
 
 CMD_FW_BEGIN = 0xA1
@@ -93,6 +96,7 @@ def main() -> int:
     ap.add_argument("--target", choices=sorted(CK6100_IMAGES), help="Known firmware target (verifies SHA-256)")
     ap.add_argument("--image", type=Path, help="Path to firmware .bin")
     ap.add_argument("--allow-downgrade", action="store_true", help="Allow flashing 1.20 onto 1.22")
+    ap.add_argument("--allow-low-idle", action="store_true", help=f"Allow flashing when device idle < {MIN_SAFE_IDLE_S} s")
     ap.add_argument("--plan-only", action="store_true", help="Verify image & print packet plan offline (no USB)")
     ap.add_argument("--flash", action="store_true", help="Actually send A1/A2/A3/A0 (requires --confirm CK-6100)")
     ap.add_argument("--confirm", default="", help="Must be CK-6100 when --flash is used")
@@ -132,7 +136,8 @@ def main() -> int:
         fw_str = sess.ident.get(4, b"").rstrip(b"\x00").decode("ascii", "replace")
         ver = sess.transact(encode_getter(CMD_GET_VERSION), CMD_GET_VERSION).payload
         cur_fw = f"{ver[2]}.{ver[3]:02x}"
-        print(f"Device: serial={sess.actual_serial} model={model} hw={hw_str} fw={fw_str} raw_ver={ver.hex(' ')}")
+        idle_s = struct.unpack(">H", sess.transact(encode_getter(CMD_GET_IDLE_INTERVAL), CMD_GET_IDLE_INTERVAL).payload)[0]
+        print(f"Device: serial={sess.actual_serial} model={model} hw={hw_str} fw={fw_str} idle={idle_s}s raw_ver={ver.hex(' ')}")
 
         if model != "CK-6100" or ver[:2] != b"\x03\x00":
             raise SystemExit(f"Refusing unexpected device identity: model={model} ver={ver.hex(' ')}")
@@ -140,6 +145,11 @@ def main() -> int:
             raise SystemExit("Refusing 1.22 -> 1.20 downgrade without --allow-downgrade.")
         if args.target is not None and cur_fw == args.target:
             raise SystemExit(f"Device is already on {args.target}; refusing.")
+        if idle_s < MIN_SAFE_IDLE_S:
+            msg = f"Device idle interval is {idle_s} s (< {MIN_SAFE_IDLE_S} s); raise it first (e.g. ../clicksctl set --idle 300) or pass --allow-low-idle."
+            if args.flash and not args.allow_low_idle:
+                raise SystemExit(f"Refusing --flash: {msg}")
+            print(f"Warning: {msg}", file=sys.stderr)
 
         if not args.flash:
             print("Dry-run complete (pre-flight checks passed, no A1/A2/A3/A0 packets sent).")
