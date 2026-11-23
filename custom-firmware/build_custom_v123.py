@@ -272,7 +272,7 @@ def main() -> None:
         b[off : off + 4] = enc_jal(0, a.labels[lbl] - paddr)
     b.extend(tramp_bytes)
 
-    # --- 5. Patch & relocate HID report descriptor to 0x6d20 ---
+    # --- 5. Patch & relocate HID report descriptor to 0x6e00 ---
     # 1) Widen modifier range 0xE0..0xE3 (4 bits + 4-bit pad) -> 0xE0..0xE7 (all 8 bits, incl. Right Alt 0x40)
     # 2) App-grid (0x01AE) -> AC Home (0x0223), Mic (0x00CF) -> AC Back (0x0224), add Play/Pause (0x00CD) as bit 3
     orig_hd = bytes(b[0x4854 : 0x4854 + 97])
@@ -301,7 +301,7 @@ def main() -> None:
 
     # Patch GET_DESCRIPTOR HID report pointer at 0x3ce4..0x3ce9:
     #   0x3ce4: 1d 65       c.lui a0, 7
-    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x2e0 (0x6d20)
+    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x200 (0x6e00)
     assert b[0x1CE4:0x1CEA] == bytes.fromhex("1d6513054585")
     b[0x1CE6:0x1CEA] = enc_addi(10, 10, reloc_addr - 0x7000)
 
@@ -310,12 +310,22 @@ def main() -> None:
     b[0x4840:0x4842] = b"\x23\x01"
     b[0x4A95:0x4A9A] = b"1.2.3"
 
-    DST.write_bytes(b)
+    assert len(b) <= 0x69FF, f"image exceeds bootloader max 0x69ff: {len(b)}"
+
     extra = ""
     if Cs is not None:
         md = Cs(CS_ARCH_RISCV, CS_MODE_RISCV32 | CS_MODE_RISCVC)
         insns = list(md.disasm(tramp_bytes, BASE + len(src_bytes)))
-        extra = f", {len(insns)} insns"
+        assert sum(i.size for i in insns) == len(tramp_bytes), "trampoline decode gap"
+        orig_addrs = {i.address for i in md.disasm(src_bytes[0xC00:0x1400], 0x2C00)}
+        check_addrs = [0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6]
+        for _, paddr, _, raddr, *_ in key_specs:
+            check_addrs.extend((paddr, raddr))
+        for addr in check_addrs:
+            assert addr in orig_addrs, f"0x{addr:04x} is not a valid instruction boundary in V122"
+        extra = f", {len(insns)} insns, boundaries OK"
+
+    DST.write_bytes(b)
     print(f"Built {DST} ({len(b)} bytes, +{len(tramp_bytes)} B trampolines{extra})")
     print("sha256:", hashlib.sha256(b).hexdigest())
 
