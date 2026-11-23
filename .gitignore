@@ -221,3 +221,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Firmware binaries (downloaded/built locally)
+custom-firmware/*.bin
