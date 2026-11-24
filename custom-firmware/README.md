@@ -80,3 +80,17 @@ python3 clicks_flash.py --target 1.22 --flash --confirm CK-6100
 ```
 
 Use `--serial <serial>` if multiple Clicks devices are attached, or `--image <path>` to flash an arbitrary `.bin` file.
+
+## Recovery Mode (`352e:2307`)
+
+If a bad firmware image breaks normal USB/iAP2 flashing, the `CK-6100` has an untouched 8 KB hardware recovery bootloader:
+
+1. **Unplug** the keyboard.
+2. **Hold `Shift + 123`** (the two bottom-left keys) while **plugging it back into USB** (~1 second). It will enumerate as `352e:2307`.
+3. Flash stock `V1.22` (or `1.23-Custom`) over plain Vendor HID (use `sudo` if your udev rule only covers `352e:2306`):
+
+```bash
+sudo python3 clicks_flash.py --recovery --target 1.22 --flash --confirm CK-6100
+```
+
+4. **Unplug and replug** the keyboard (without holding any keys) to boot the flashed firmware.
