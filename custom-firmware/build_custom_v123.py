@@ -317,13 +317,34 @@ def main() -> None:
     a.label("scan_cb_copy")
     a.emit(enc_jal(0, 0x25B2 - a.addr()))        # j 0x25b2 (update snapshot & finish)
 
+    # --- 4d. USB Suspend + Remote Wakeup precedence over accs_stop (CA-2200 V1.1.5 fix) ---
+    # 1) Hook 0x2418 (lbu a5, 0x174(s0)): if USB already suspended (s2 != 0), skip 0x41ac USB disconnect.
+    assert b[0x0418:0x041C] == bytes.fromhex("83474417")
+    hooks.append((0x2418, "sleep_suspend_hook"))
+    a.label("sleep_suspend_hook")
+    a.bne_label(18, 0, "sleep_skip_disc")        # bnez s2, sleep_skip_disc
+    a.emit(bytes.fromhex("83474417"))            # lbu a5, 0x174(s0)
+    a.emit(enc_jal(0, 0x241C - a.addr()))        # j 0x241c
+    a.label("sleep_skip_disc")
+    a.emit(enc_jal(0, 0x2424 - a.addr()))        # j 0x2424 (enter STOP without disconnecting USB)
+
+    # 2) Hook 0x2432 (lbu a5, 0x174(s0)): if USB was suspended (s2 != 0), skip 0x4454 USB reconnect -> Remote Wakeup.
+    assert b[0x0432:0x0436] == bytes.fromhex("83474417")
+    hooks.append((0x2432, "wake_suspend_hook"))
+    a.label("wake_suspend_hook")
+    a.bne_label(18, 0, "wake_remote")            # bnez s2, wake_remote
+    a.emit(bytes.fromhex("83474417"))            # lbu a5, 0x174(s0)
+    a.emit(enc_jal(0, 0x2436 - a.addr()))        # j 0x2436
+    a.label("wake_remote")
+    a.emit(enc_jal(0, 0x245A - a.addr()))        # j 0x245a (checks s1 -> 0x41ea Remote Wakeup)
+
     tramp_bytes = a.resolve()
     for paddr, lbl in hooks:
         off = paddr - BASE
         b[off : off + 4] = enc_jal(0, a.labels[lbl] - paddr)
     b.extend(tramp_bytes)
 
-    # --- 5. Patch & relocate HID report descriptor to 0x6e40 ---
+    # --- 5. Patch & relocate HID report descriptor to 0x6e80 ---
     # 1) Widen modifier range 0xE0..0xE3 (4 bits + 4-bit pad) -> 0xE0..0xE7 (all 8 bits, incl. Right Alt 0x40)
     # 2) App-grid (0x01AE) -> AC Home (0x0223), Mic (0x00CF) -> AC Back (0x0224), add Play/Pause (0x00CD) as bit 3
     orig_hd = bytes(b[0x4854 : 0x4854 + 97])
@@ -338,7 +359,7 @@ def main() -> None:
     )
     assert len(hid_desc) == 94  # 0x5E
 
-    reloc_addr = 0x6E40
+    reloc_addr = 0x6E80
     pad = reloc_addr - (BASE + len(b))
     assert pad >= 0, f"trampolines ran past 0x{reloc_addr:04x}"
     b.extend(b"\xff" * pad)
@@ -352,7 +373,7 @@ def main() -> None:
 
     # Patch GET_DESCRIPTOR HID report pointer at 0x3ce4..0x3ce9:
     #   0x3ce4: 1d 65       c.lui a0, 7
-    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x1c0 (0x6e40)
+    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x180 (0x6e80)
     assert b[0x1CE4:0x1CEA] == bytes.fromhex("1d6513054585")
     b[0x1CE6:0x1CEA] = enc_addi(10, 10, reloc_addr - 0x7000)
 
@@ -369,10 +390,11 @@ def main() -> None:
         insns = list(md.disasm(tramp_bytes, BASE + len(src_bytes)))
         assert sum(i.size for i in insns) == len(tramp_bytes), "trampoline decode gap"
         orig_addrs = (
-            {i.address for i in md.disasm(src_bytes[0x4A4:0x5C6], 0x24A4)}
+            {i.address for i in md.disasm(src_bytes[0x35E:0x5C6], 0x235E)}
             | {i.address for i in md.disasm(src_bytes[0xC00:0x1400], 0x2C00)}
         )
         check_addrs = [
+            0x2418, 0x241C, 0x2424, 0x2432, 0x2436, 0x245A,
             0x24BC, 0x24C0, 0x258A, 0x25A8, 0x25B2, 0x251E,
             0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6,
         ]

@@ -12,7 +12,7 @@ Designed for **Android** using the built-in **`English (US), International style
 ## Firmware Changes
 
 ### USB HID Report Descriptor
-Relocated to `0x6e40` (`94` bytes, down from `97` bytes at `0x6854`) and updated in both `GET_DESCRIPTOR` and `wDescriptorLength`:
+Relocated to `0x6e80` (`94` bytes, down from `97` bytes at `0x6854`) and updated in both `GET_DESCRIPTOR` and `wDescriptorLength`:
 - **Modifiers widened (`0xE0..0xE3` → `0xE0..0xE7`):** exposes all 8 modifier bits, enabling `Right Alt / AltGr` (`0x40`).
 - **App Grid (`0x01AE`) → `AC Home` (`0x0223`):** acts as Android Home.
 - **Mic (`0x00CF`) → `AC Back` (`0x0224`):** acts as Android Back.
@@ -22,6 +22,7 @@ Relocated to `0x6e40` (`94` bytes, down from `97` bytes at `0x6854`) and updated
 - **`Shift + Backspace` → `Delete`** (`0x4C`, with `Shift` cleared).
 - **`Globe + Cmd` → `Media Play/Pause`** (Consumer usage `0x00CD`, replacing `Globe` + `Cmd` when held together).
 - **USB-busy key-report retry (`UEP1_TX_CTRL` hardware check):** if USB HID EP1 TX still holds an unread report (`UEP1_TX_CTRL[1:0] == 0` / ACK) when a key press/release occurs, the matrix scanner defers updating EP1 TX and retries every 2 ms (up to 60 ticks / 120 ms) instead of overwriting the unread report.
+- **USB Suspend + Remote Wakeup precedence over `accs_stop` (ported from `CA-2200` `V1.1.5`):** when `accs_stop` is enabled and the host has already put USB into Suspend, skip disconnecting USB before `STOP` mode and wake via USB Remote Wakeup instead of forcing a full USB re-enumeration (falling back to disconnect/re-enumerate only if the host did not suspend USB).
 
 ### `Shift + 123 + <key>` Layer
 | Row | Key | Output | HID Sent |

@@ -44,7 +44,7 @@ HERE = Path(__file__).resolve().parent
 CK6100_IMAGES = {
     "1.23-Custom": (
         HERE / "iKeyboard_CK-6100_V123_300_Custom.bin",
-        "ec71a48c2bc49d81ff35a2793e0b2abaa461c0954059f39dcac6991034becd35",
+        "33bea37f4449c53b8f41c0ea91f0520e1bf7c6b099aec5b345fc92c76a9c4ce4",
     ),
     "1.22": (
         HERE / "iKeyboard_CK-6100_V122_300.bin",
