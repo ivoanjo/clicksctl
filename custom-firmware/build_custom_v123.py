@@ -318,6 +318,18 @@ def main() -> None:
     a.emit(enc_jal(0, 0x25B2 - a.addr()))        # j 0x25b2 (update snapshot & finish)
 
     # --- 4d. USB Suspend + Remote Wakeup precedence over accs_stop (CA-2200 V1.1.5 fix) ---
+    # 0) Hook 0x23d8 (c.lw a5, 8(s0); c.beqz a5, 0x20): when accs_stop=ON and USB is already suspended (s2 != 0),
+    #    enter STOP mode (0x23fa) immediately instead of spinning at 48 MHz until the idle timer expires.
+    assert b[0x03D8:0x03DC] == bytes.fromhex("1c4485c3")
+    hooks.append((0x23D8, "sleep_entry_hook"))
+    a.label("sleep_entry_hook")
+    a.bne_label(18, 0, "sleep_enter_stop")       # bnez s2, sleep_enter_stop
+    a.emit(struct.pack("<I", 0x00842783))        # lw a5, 8(s0)
+    a.beq_label(15, 0, "sleep_enter_stop")       # beqz a5, sleep_enter_stop
+    a.emit(enc_jal(0, 0x23DC - a.addr()))        # j 0x23dc (idle > 0 and not suspended -> skip STOP)
+    a.label("sleep_enter_stop")
+    a.emit(enc_jal(0, 0x23FA - a.addr()))        # j 0x23fa (enter STOP mode)
+
     # 1) Hook 0x2418 (lbu a5, 0x174(s0)): if USB already suspended (s2 != 0), skip 0x41ac USB disconnect.
     assert b[0x0418:0x041C] == bytes.fromhex("83474417")
     hooks.append((0x2418, "sleep_suspend_hook"))
@@ -399,6 +411,7 @@ def main() -> None:
             | {i.address for i in md.disasm(src_bytes[0xC00:0x1400], 0x2C00)}
         )
         check_addrs = [
+            0x23D8, 0x23DC, 0x23FA,
             0x2418, 0x241C, 0x2424, 0x2432, 0x2436, 0x245A,
             0x24BC, 0x24C0, 0x258A, 0x25A8, 0x25B2, 0x251E,
             0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6,
