@@ -20,7 +20,10 @@ except ImportError:  # optional: only used to print disassembled instruction cou
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "iKeyboard_CK-6100_V122_300.bin"
-DST = HERE / "iKeyboard_CK-6100_V123_300_Custom.bin"
+DST_BY_LAYOUT = {
+    "us-intl": HERE / "iKeyboard_CK-6100_V123_300_Custom.bin",
+    "pt": HERE / "iKeyboard_CK-6100_V123_300_Custom_PT.bin",
+}
 V122_URL = "https://xinyi1.clicks.tech/CK-6100/iKeyboard_CK-6100_V122_300.bin"
 V122_SHA256 = "0e33d5132084d31258e1c300cc23e67e73d23179b9d57b03a8d62717a2b725c2"
 BASE = 0x2000
@@ -147,9 +150,12 @@ class Asm:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Build custom CK-6100 V123 firmware from stock V122")
+    ap.add_argument("--layout", choices=("us-intl", "pt"), default="us-intl", help="Target OS keyboard layout (default: us-intl)")
     ap.add_argument("--no-download", action="store_true", help="Fail if V122 is missing instead of downloading")
     ap.add_argument("--download", action="store_true", help="Force re-downloading upstream V122")
     args = ap.parse_args()
+    is_pt = args.layout == "pt"
+    dst = DST_BY_LAYOUT[args.layout]
 
     src_bytes = ensure_v122(SRC, download=not args.no_download, force_download=args.download)
     b = bytearray(src_bytes)
@@ -195,6 +201,15 @@ def main() -> None:
     a.emit(struct.pack("<I", 0x0FF87813))        # andi a6, a6, 0xff
     a.jal_label(0, "mux_done")
     a.label("mux_alt")
+    if is_pt:
+        # If bit 26 of a6 is set, assert Left Shift (0x02) on 123+<key> (for PT '/' on S and ';' on F)
+        a.emit(struct.pack("<I", 0x01A85313))    # srli t1, a6, 26
+        a.emit(struct.pack("<I", 0x00137313))    # andi t1, t1, 1
+        a.beq_label(6, 0, "mux_alt_shift")       # beqz t1, mux_alt_shift
+        a.emit(struct.pack("<I", 0x00064383))    # lbu t2, 0(a2)
+        a.emit(struct.pack("<I", 0x0023E393))    # ori t2, t2, 2 (Left Shift)
+        a.emit(struct.pack("<I", 0x00760023))    # sb t2, 0(a2)
+        a.label("mux_alt_shift")
     a.emit(struct.pack("<I", 0x00885813))        # srli a6, a6, 8
     a.label("mux_normal")
     a.emit(struct.pack("<I", 0x0FF87813))        # andi a6, a6, 0xff
@@ -205,28 +220,52 @@ def main() -> None:
     a.emit(struct.pack("<I", 0x00028067))        # jr t0
 
     # --- 3. Shift + 123 + key hooks (all using shift123_mux) ---
-    # (name, patch_addr, orig_hex, ret_addr, normal, alt, shift_alt, shift_flag)
-    key_specs = [
-        ("a", 0x30DE, "1308d002", 0x3030, 0x04, 0x2D, 0x2D, 1),  # _ (Shift + -)
-        ("q", 0x2EA8, "794891e3", 0x2EAE, 0x14, 0x1E, 0x36, 1),  # < (Shift + ,)
-        ("w", 0x30B2, "7d48e390", 0x2E54, 0x1A, 0x1F, 0x37, 1),  # > (Shift + .)
-        ("s", 0x30C8, "13088003", 0x2FBA, 0x16, 0x38, 0x31, 0),  # \ (no Shift)
-        ("d", 0x30D4, "13083003", 0x2FE4, 0x07, 0x33, 0x2F, 1),  # { (Shift + [)
-        ("f", 0x2FF4, "13083003", 0x2FFC, 0x09, 0x33, 0x30, 1),  # } (Shift + ])
-        ("g", 0x3040, "13086002", 0x3048, 0x0A, 0x26, 0x2F, 0),  # [ (no Shift)
-        ("h", 0x3062, "13087002", 0x306A, 0x0B, 0x27, 0x30, 0),  # ] (no Shift)
-        ("k", 0x3206, "13084003", 0x316E, 0x0E, 0x34, 0x34, 0),  # ´ (dead_acute ' on US-Intl, no Shift)
-        ("l", 0x3210, "13084003", 0x3218, 0x0F, 0x34, 0x23, 1),  # ^ (Shift + 6)
-        ("z", 0x2CDC, "13082002", 0x2CE4, 0x1D, 0x22, 0x2E, 1),  # + (Shift + =)
-        ("u", 0x2F0C, "13084002", 0x2F14, 0x18, 0x24, 0x21, 3),  # £ (Right Alt + Shift + 4)
-        ("i", 0x30BC, "13085002", 0x2F48, 0x0C, 0x25, 0x2D, 2),  # ¥ (Right Alt + -)
-        ("m", 0x2DA6, "13087003", 0x2DAE, 0x10, 0x37, 0x35, 0),  # ` (no Shift)
-        ("n", 0x2D84, "13086003", 0x2D8C, 0x11, 0x36, 0x35, 1),  # ~ (dead_tilde Shift+` on US-Intl)
-        ("x", 0x2CFE, "13084002", 0x2D06, 0x1B, 0x24, 0x2E, 0),  # = (no Shift)
-        ("c", 0x2D20, "13085002", 0x2D28, 0x06, 0x25, 0x36, 2),  # ç (Right Alt + ,)
-        ("v", 0x2D42, "13088003", 0x2D4A, 0x19, 0x38, 0x36, 3),  # Ç (Right Alt + Shift + ,)
-        ("b", 0x2D64, "794891e3", 0x2D6A, 0x05, 0x1E, 0x31, 1),  # | (Shift + \)
-    ]
+    # (name, patch_addr, orig_hex, ret_addr, normal, alt, shift_alt, flags)
+    # flags: bit0=LeftShift on Shift+123, bit1=RightAlt on Shift+123, bit2=add LeftShift on 123 (pt only)
+    if is_pt:
+        key_specs = [
+            ("a", 0x30DE, "1308d002", 0x3030, 0x04, 0x38, 0x38, 1),  # 123: - (/) | S+123: _ (Shift+/)
+            ("q", 0x2EA8, "794891e3", 0x2EAE, 0x14, 0x1E, 0x64, 0),  # 123: 1     | S+123: < (ISO 0x64)
+            ("w", 0x30B2, "7d48e390", 0x2E54, 0x1A, 0x1F, 0x64, 1),  # 123: 2     | S+123: > (Shift+0x64)
+            ("s", 0x30C8, "13088003", 0x2FBA, 0x16, 0x24, 0x35, 4),  # 123: / (Shift+7) | S+123: \ (`)
+            ("d", 0x30D4, "13083003", 0x2FE4, 0x07, 0x37, 0x24, 2),  # 123: : (Shift+.) | S+123: { (AltGr+7)
+            ("f", 0x2FF4, "13083003", 0x2FFC, 0x09, 0x36, 0x27, 6),  # 123: ; (Shift+,) | S+123: } (AltGr+0)
+            ("g", 0x3040, "13086002", 0x3048, 0x0A, 0x25, 0x25, 2),  # 123: ( (Shift+8) | S+123: [ (AltGr+8)
+            ("h", 0x3062, "13087002", 0x306A, 0x0B, 0x26, 0x26, 2),  # 123: ) (Shift+9) | S+123: ] (AltGr+9)
+            ("k", 0x3206, "13084003", 0x316E, 0x0E, 0x2D, 0x30, 0),  # 123: ' (non-dead -)| S+123: ´ (dead_acute ])
+            ("l", 0x3210, "13084003", 0x3218, 0x0F, 0x1F, 0x31, 1),  # 123: " (Shift+2) | S+123: ^ (dead_circ Shift+\)
+            ("z", 0x2CDC, "13082002", 0x2CE4, 0x1D, 0x22, 0x2F, 0),  # 123: % (Shift+5) | S+123: + ([)
+            ("u", 0x2F0C, "13084002", 0x2F14, 0x18, 0x24, 0x20, 2),  # 123: 7     | S+123: £ (AltGr+3)
+            ("i", 0x30BC, "13085002", 0x2F48, 0x0C, 0x25, 0x1C, 3),  # 123: 8     | S+123: ¥ (AltGr+Shift+Y)
+            ("m", 0x2DA6, "13087003", 0x2DAE, 0x10, 0x37, 0x30, 1),  # 123: .     | S+123: ` (dead_grave Shift+])
+            ("n", 0x2D84, "13086003", 0x2D8C, 0x11, 0x36, 0x31, 0),  # 123: ,     | S+123: ~ (dead_tilde \)
+            ("x", 0x2CFE, "13084002", 0x2D06, 0x1B, 0x23, 0x27, 1),  # 123: & (Shift+6) | S+123: = (Shift+0)
+            ("c", 0x2D20, "13085002", 0x2D28, 0x06, 0x2F, 0x33, 0),  # 123: * (Shift+[) | S+123: ç (;)
+            ("v", 0x2D42, "13088003", 0x2D4A, 0x19, 0x2D, 0x33, 1),  # 123: ? (Shift+-) | S+123: Ç (Shift+;)
+            ("b", 0x2D64, "794891e3", 0x2D6A, 0x05, 0x1E, 0x35, 1),  # 123: ! (Shift+1) | S+123: | (Shift+`)
+        ]
+    else:
+        key_specs = [
+            ("a", 0x30DE, "1308d002", 0x3030, 0x04, 0x2D, 0x2D, 1),  # _ (Shift + -)
+            ("q", 0x2EA8, "794891e3", 0x2EAE, 0x14, 0x1E, 0x36, 1),  # < (Shift + ,)
+            ("w", 0x30B2, "7d48e390", 0x2E54, 0x1A, 0x1F, 0x37, 1),  # > (Shift + .)
+            ("s", 0x30C8, "13088003", 0x2FBA, 0x16, 0x38, 0x31, 0),  # \ (no Shift)
+            ("d", 0x30D4, "13083003", 0x2FE4, 0x07, 0x33, 0x2F, 1),  # { (Shift + [)
+            ("f", 0x2FF4, "13083003", 0x2FFC, 0x09, 0x33, 0x30, 1),  # } (Shift + ])
+            ("g", 0x3040, "13086002", 0x3048, 0x0A, 0x26, 0x2F, 0),  # [ (no Shift)
+            ("h", 0x3062, "13087002", 0x306A, 0x0B, 0x27, 0x30, 0),  # ] (no Shift)
+            ("k", 0x3206, "13084003", 0x316E, 0x0E, 0x34, 0x34, 0),  # ´ (dead_acute ' on US-Intl, no Shift)
+            ("l", 0x3210, "13084003", 0x3218, 0x0F, 0x34, 0x23, 1),  # ^ (Shift + 6)
+            ("z", 0x2CDC, "13082002", 0x2CE4, 0x1D, 0x22, 0x2E, 1),  # + (Shift + =)
+            ("u", 0x2F0C, "13084002", 0x2F14, 0x18, 0x24, 0x21, 3),  # £ (Right Alt + Shift + 4)
+            ("i", 0x30BC, "13085002", 0x2F48, 0x0C, 0x25, 0x2D, 2),  # ¥ (Right Alt + -)
+            ("m", 0x2DA6, "13087003", 0x2DAE, 0x10, 0x37, 0x35, 0),  # ` (no Shift)
+            ("n", 0x2D84, "13086003", 0x2D8C, 0x11, 0x36, 0x35, 1),  # ~ (dead_tilde Shift+` on US-Intl)
+            ("x", 0x2CFE, "13084002", 0x2D06, 0x1B, 0x24, 0x2E, 0),  # = (no Shift)
+            ("c", 0x2D20, "13085002", 0x2D28, 0x06, 0x25, 0x36, 2),  # ç (Right Alt + ,)
+            ("v", 0x2D42, "13088003", 0x2D4A, 0x19, 0x38, 0x36, 3),  # Ç (Right Alt + Shift + ,)
+            ("b", 0x2D64, "794891e3", 0x2D6A, 0x05, 0x1E, 0x31, 1),  # | (Shift + \)
+        ]
 
     hooks: list[tuple[int, str]] = [(0x31A8, "bksp_hook")]
     for name, paddr, ohex, raddr, nkc, akc, sakc, sflg in key_specs:
@@ -254,11 +293,27 @@ def main() -> None:
     a.emit(struct.pack("<I", 0xFFD8F893))        # andi a7, a7, -3 (clear Left Shift 0x02)
     a.emit(struct.pack("<I", 0x0408E893))        # ori a7, a7, 0x40 (Right Alt / AltGr)
     a.emit(struct.pack("<I", 0x01160023))        # sb a7, 0(a2)
-    a.emit(struct.pack("<I", 0x02200893))        # addi a7, zero, 0x22 ('5' -> AltGr+5 = € on Linux us-intl/altgr-intl)
+    a.emit(enc_addi(17, 0, 0x08 if is_pt else 0x22))  # AltGr+E (pt) or AltGr+5 (us-intl) = €
     a.emit(enc_jal(0, 0x309E - a.addr()))        # j 0x309e
     a.label("j_normal")
     a.emit(struct.pack("<I", 0x00D00893))        # addi a7, zero, 0x0d ('j')
     a.emit(enc_jal(0, 0x309E - a.addr()))        # j 0x309e
+
+    if is_pt:
+        # --- 4a. @ key (0x30a6) -> Right Alt + 2 on Portuguese (clear Left Shift, set Right Alt 0x40) ---
+        # Guard on a5 == 0 because 0x2dde (123+@ -> '#') also branches to 0x30a6 with a5 != 0 and a7 = 0x20.
+        assert b[0x10A6:0x10AA] == bytes.fromhex("23001801")
+        hooks.append((0x30A6, "at_hook"))
+        a.label("at_hook")
+        a.bne_label(15, 0, "at_store")           # bnez a5, at_store (123+@ -> keep Shift+0x20 = '#')
+        a.emit(struct.pack("<I", 0x00064883))    # lbu a7, 0(a2)
+        a.emit(struct.pack("<I", 0xFFD8F893))    # andi a7, a7, -3 (clear Left Shift 0x02)
+        a.emit(struct.pack("<I", 0x0408E893))    # ori a7, a7, 0x40 (Right Alt / AltGr)
+        a.emit(struct.pack("<I", 0x01160023))    # sb a7, 0(a2)
+        a.emit(struct.pack("<I", 0x01F00893))    # addi a7, zero, 0x1f ('2')
+        a.label("at_store")
+        a.emit(bytes.fromhex("23001801"))        # sb a7, 0(a6)
+        a.emit(enc_jal(0, 0x2DEC - a.addr()))    # j 0x2dec
 
     # --- 4b. Globe + Cmd -> Media Play/Pause (bit 3 = 0x08 in consumer byte 6(a2)) ---
     assert b[0x11BC:0x11C0] == bytes.fromhex("858b89c7")
@@ -371,7 +426,7 @@ def main() -> None:
     )
     assert len(hid_desc) == 94  # 0x5E
 
-    reloc_addr = 0x6E80
+    reloc_addr = 0x6EC0 if is_pt else 0x6E80
     pad = reloc_addr - (BASE + len(b))
     assert pad >= 0, f"trampolines ran past 0x{reloc_addr:04x}"
     b.extend(b"\xff" * pad)
@@ -416,14 +471,16 @@ def main() -> None:
             0x24BC, 0x24C0, 0x258A, 0x25A8, 0x25B2, 0x251E,
             0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6,
         ]
+        if is_pt:
+            check_addrs.extend((0x30A6, 0x2DEC))
         for _, paddr, _, raddr, *_ in key_specs:
             check_addrs.extend((paddr, raddr))
         for addr in check_addrs:
             assert addr in orig_addrs, f"0x{addr:04x} is not a valid instruction boundary in V122"
         extra = f", {len(insns)} insns, boundaries OK"
 
-    DST.write_bytes(b)
-    print(f"Built {DST} ({len(b)} bytes, +{len(tramp_bytes)} B trampolines{extra})")
+    dst.write_bytes(b)
+    print(f"Built {dst} [{args.layout}] ({len(b)} bytes, +{len(tramp_bytes)} B trampolines{extra})")
     print("sha256:", hashlib.sha256(b).hexdigest())
 
 

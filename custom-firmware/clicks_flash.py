@@ -46,6 +46,10 @@ CK6100_IMAGES = {
         HERE / "iKeyboard_CK-6100_V123_300_Custom.bin",
         "435623f49c9f793c253c7efa94c7f791530ed9033053f097dfb7323a91ec06e6",
     ),
+    "1.23-Custom-PT": (
+        HERE / "iKeyboard_CK-6100_V123_300_Custom_PT.bin",
+        "454cec0e772be84b8f863f28002446c15b6e104258357a7b9c7c173d537eb8ac",
+    ),
     "1.22": (
         HERE / "iKeyboard_CK-6100_V122_300.bin",
         "0e33d5132084d31258e1c300cc23e67e73d23179b9d57b03a8d62717a2b725c2",
