@@ -78,6 +78,13 @@ def enc_bne(rs1: int, rs2: int, off: int) -> bytes:
     return struct.pack("<I", w)
 
 
+def enc_bgeu(rs1: int, rs2: int, off: int) -> bytes:
+    assert -0x1000 <= off < 0x1000 and off % 2 == 0
+    u = off & 0x1FFF
+    w = ((u >> 12) & 1) << 31 | ((u >> 5) & 0x3F) << 25 | (rs2 << 20) | (rs1 << 15) | (7 << 12) | ((u >> 1) & 0xF) << 8 | ((u >> 11) & 1) << 7 | 0x63
+    return struct.pack("<I", w)
+
+
 def enc_addi(rd: int, rs1: int, imm: int) -> bytes:
     assert -2048 <= imm < 2048
     return struct.pack("<I", ((imm & 0xFFF) << 20) | (rs1 << 15) | (rd << 7) | 0x13)
@@ -120,6 +127,11 @@ class Asm:
         pos = len(self.buf)
         self.buf.extend(b"\x00\x00\x00\x00")
         self.fixups.append((pos, target, lambda off: enc_bne(rs1, rs2, off)))
+
+    def bgeu_label(self, rs1: int, rs2: int, target: str) -> None:
+        pos = len(self.buf)
+        self.buf.extend(b"\x00\x00\x00\x00")
+        self.fixups.append((pos, target, lambda off: enc_bgeu(rs1, rs2, off)))
 
     def jal_label(self, rd: int, target: str) -> None:
         pos = len(self.buf)
@@ -266,13 +278,52 @@ def main() -> None:
     a.label("globe_cmd_skip_globe")
     a.emit(enc_jal(0, 0x31C8 - a.addr()))        # j 0x31c8
 
+    # --- 4c. USB EP1 TX busy key-report retry (hardware UEP1_TX_CTRL check) ---
+    # 1) Hook 0x24bc (bne a3, a1, 0xce): allow scan in active/retry states 1..61 (forcing a3=1 for 0x2570)
+    assert b[0x04BC:0x04C0] == bytes.fromhex("6397b60c")
+    hooks.append((0x24BC, "scan_state_hook"))
+    a.label("scan_state_hook")
+    a.emit(struct.pack("<I", 0xFFF68793))        # addi a5, a3, -1
+    a.emit(enc_addi(13, 0, 61))                  # addi a3, zero, 61 (max active/retry state = 60 * 2ms = 120ms)
+    a.bgeu_label(15, 13, "scan_state_idle")      # bgeu a5, a3, scan_state_idle (state == 0 or >= 62)
+    a.emit(struct.pack("<I", 0x00100693))        # addi a3, zero, 1 (keep a3=1 for 0x2570 sll)
+    a.emit(enc_jal(0, 0x24C0 - a.addr()))        # j 0x24c0
+    a.label("scan_state_idle")
+    a.emit(enc_jal(0, 0x258A - a.addr()))        # j 0x258a
+
+    # 2) Hook 0x25a8 (c.lw a5, 0x20(s0); c.beqz a5, 8): if UEP1_TX_CTRL[1:0] == 0 (ACK / previous HID report
+    #    still unread by host), defer callback & snapshot update up to 60 scan ticks (120 ms) so EP1 TX isn't overwritten.
+    assert b[0x05A8:0x05AC] == bytes.fromhex("1c5081c7")
+    hooks.append((0x25A8, "scan_cb_hook"))
+    a.label("scan_cb_hook")
+    a.emit(struct.pack("<I", 0x400237B7))        # lui a5, 0x40023 (USBFS base)
+    a.emit(struct.pack("<I", 0x4267D783))        # lhu a5, 0x426(a5) (UEP1_TX_CTRL)
+    a.emit(struct.pack("<I", 0x0037F793))        # andi a5, a5, 3
+    a.bne_label(15, 0, "scan_cb_ready")          # bnez a5, scan_cb_ready (NAK/idle -> ready)
+    a.emit(struct.pack("<I", 0x00044703))        # lbu a4, 0(s0)
+    a.emit(enc_addi(15, 0, 61))                  # addi a5, zero, 61 (60 retries * 2ms = 120ms)
+    a.bgeu_label(14, 15, "scan_cb_ready")        # bgeu a4, a5, scan_cb_ready (give up if host stopped polling)
+    a.emit(struct.pack("<I", 0x00170713))        # addi a4, a4, 1
+    a.emit(struct.pack("<I", 0x00E40023))        # sb a4, 0(s0)
+    a.emit(enc_jal(0, 0x251E - a.addr()))        # j 0x251e (epilogue without updating snapshot)
+    a.label("scan_cb_ready")
+    a.emit(struct.pack("<I", 0x00100713))        # addi a4, zero, 1
+    a.emit(struct.pack("<I", 0x00E40023))        # sb a4, 0(s0) (reset state = 1)
+    a.emit(struct.pack("<I", 0x02042783))        # lw a5, 0x20(s0)
+    a.beq_label(15, 0, "scan_cb_copy")           # beqz a5, scan_cb_copy
+    a.emit(struct.pack("<I", 0x01C42503))        # lw a0, 0x1c(s0)
+    a.emit(struct.pack("<I", 0x00400613))        # addi a2, zero, 4
+    a.emit(struct.pack("<I", 0x000780E7))        # jalr ra, a5, 0
+    a.label("scan_cb_copy")
+    a.emit(enc_jal(0, 0x25B2 - a.addr()))        # j 0x25b2 (update snapshot & finish)
+
     tramp_bytes = a.resolve()
     for paddr, lbl in hooks:
         off = paddr - BASE
         b[off : off + 4] = enc_jal(0, a.labels[lbl] - paddr)
     b.extend(tramp_bytes)
 
-    # --- 5. Patch & relocate HID report descriptor to 0x6e00 ---
+    # --- 5. Patch & relocate HID report descriptor to 0x6e40 ---
     # 1) Widen modifier range 0xE0..0xE3 (4 bits + 4-bit pad) -> 0xE0..0xE7 (all 8 bits, incl. Right Alt 0x40)
     # 2) App-grid (0x01AE) -> AC Home (0x0223), Mic (0x00CF) -> AC Back (0x0224), add Play/Pause (0x00CD) as bit 3
     orig_hd = bytes(b[0x4854 : 0x4854 + 97])
@@ -287,7 +338,7 @@ def main() -> None:
     )
     assert len(hid_desc) == 94  # 0x5E
 
-    reloc_addr = 0x6E00
+    reloc_addr = 0x6E40
     pad = reloc_addr - (BASE + len(b))
     assert pad >= 0, f"trampolines ran past 0x{reloc_addr:04x}"
     b.extend(b"\xff" * pad)
@@ -301,7 +352,7 @@ def main() -> None:
 
     # Patch GET_DESCRIPTOR HID report pointer at 0x3ce4..0x3ce9:
     #   0x3ce4: 1d 65       c.lui a0, 7
-    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x200 (0x6e00)
+    #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x1c0 (0x6e40)
     assert b[0x1CE4:0x1CEA] == bytes.fromhex("1d6513054585")
     b[0x1CE6:0x1CEA] = enc_addi(10, 10, reloc_addr - 0x7000)
 
@@ -317,8 +368,14 @@ def main() -> None:
         md = Cs(CS_ARCH_RISCV, CS_MODE_RISCV32 | CS_MODE_RISCVC)
         insns = list(md.disasm(tramp_bytes, BASE + len(src_bytes)))
         assert sum(i.size for i in insns) == len(tramp_bytes), "trampoline decode gap"
-        orig_addrs = {i.address for i in md.disasm(src_bytes[0xC00:0x1400], 0x2C00)}
-        check_addrs = [0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6]
+        orig_addrs = (
+            {i.address for i in md.disasm(src_bytes[0x4A4:0x5C6], 0x24A4)}
+            | {i.address for i in md.disasm(src_bytes[0xC00:0x1400], 0x2C00)}
+        )
+        check_addrs = [
+            0x24BC, 0x24C0, 0x258A, 0x25A8, 0x25B2, 0x251E,
+            0x31A8, 0x31AC, 0x30E8, 0x30EC, 0x309E, 0x31BC, 0x31C0, 0x31C8, 0x31D6,
+        ]
         for _, paddr, _, raddr, *_ in key_specs:
             check_addrs.extend((paddr, raddr))
         for addr in check_addrs:
