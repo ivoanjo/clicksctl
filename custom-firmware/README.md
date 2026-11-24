@@ -11,12 +11,13 @@ Designed for **Android** using the built-in **`English (US), International style
 
 ## Firmware Changes
 
-### USB HID Report Descriptor
+### USB HID & Endpoint Descriptors
 Relocated to `0x6e80` (`94` bytes, down from `97` bytes at `0x6854`) and updated in both `GET_DESCRIPTOR` and `wDescriptorLength`:
 - **Modifiers widened (`0xE0..0xE3` → `0xE0..0xE7`):** exposes all 8 modifier bits, enabling `Right Alt / AltGr` (`0x40`).
 - **App Grid (`0x01AE`) → `AC Home` (`0x0223`):** acts as Android Home.
 - **Mic (`0x00CF`) → `AC Back` (`0x0224`):** acts as Android Back.
 - **Added `Play/Pause` (`0x00CD`):** added to the Consumer Report (bit `3` / `0x08`).
+- **HID polling interval (`bInterval`: `1 ms` → `8 ms`):** lowered EP `0x81` / `0x01` Interrupt polling from 1000 Hz to 125 Hz (matching the 8 ms matrix scan rate) to reduce active USB host wakeups on Android.
 
 ### Key & Combo Remaps
 - **`Shift + Backspace` → `Delete`** (`0x4C`, with `Shift` cleared).

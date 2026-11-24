@@ -371,6 +371,11 @@ def main() -> None:
     assert b[0x1CCE:0x1CD2] == bytes.fromhex("93071006")
     b[0x1CCE:0x1CD2] = enc_addi(15, 0, len(hid_desc))
 
+    # Raise HID Interrupt EP 0x81 / 0x01 bInterval from 1 ms (1000 Hz) to 8 ms (125 Hz, matching 8 ms matrix scan)
+    assert b[0x47EF:0x47FD] == bytes.fromhex("0705810340000107050103400001")
+    b[0x47F5] = 8
+    b[0x47FC] = 8
+
     # Patch GET_DESCRIPTOR HID report pointer at 0x3ce4..0x3ce9:
     #   0x3ce4: 1d 65       c.lui a0, 7
     #   0x3ce6: 13 05 45 85 addi  a0, a0, -0x7ac  (0x6854) -> -0x180 (0x6e80)
